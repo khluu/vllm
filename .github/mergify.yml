@@ -5,6 +5,7 @@ pull_request_rules:
       - "#commits-behind >= 10"
     actions:
       rebase:
+
 - name: label-documentation
   description: Automatically apply documentation label
   conditions:
