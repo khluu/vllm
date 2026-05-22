@@ -18,7 +18,7 @@ import socket
 import threading
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 import regex as re
 import torch
@@ -64,6 +64,12 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 
 MOONCAKE_NO_AVAILABLE_HANDLE = -200
+_T = TypeVar("_T")
+
+
+def _rotate_list(values: list[_T], offset: int) -> list[_T]:
+    return values[offset:] + values[:offset]
+
 
 # Mirrors FileStorageConfig::local_buffer_size in Mooncake C++.
 DEFAULT_MOONCAKE_DISK_STAGING_BUFFER_BYTES = 1280 * 1024 * 1024
@@ -644,6 +650,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             ready_event,
             name="KVCacheStoreRecvingThread",
         )
+        # _invalid_block_ids can be access by both the Worker and RecvingThread
+        self._invalid_block_ids_lock = threading.Lock()
+        self._invalid_block_ids: set[int] = set()
         self.disk_offload_buffer_budget_bytes = disk_offload_buffer_budget_bytes
         self.usable_disk_offload_buffer_budget_bytes = (
             None
@@ -653,6 +662,16 @@ class KVCacheStoreRecvingThread(KVTransferThread):
             )
         )
         self.coord = coord
+
+    def _add_load_error_block_ids(self, block_ids: list[int]) -> None:
+        with self._invalid_block_ids_lock:
+            self._invalid_block_ids.update(block_ids)
+
+    def get_and_clear_block_ids_with_load_errors(self) -> set[int]:
+        with self._invalid_block_ids_lock:
+            invalid_block_ids = self._invalid_block_ids.copy()
+            self._invalid_block_ids.clear()
+        return invalid_block_ids
 
     def _handle_request(self, req_meta: ReqMeta):
         token_len = req_meta.load_spec.token_len  # type: ignore[union-attr]
@@ -670,6 +689,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         addr_list: list[list[int]] = []
         size_list: list[list[int]] = []
         key_list: list[str] = []
+        block_id_list: list[int] = []
         for g_idx, db in enumerate(self.token_databases):
             mask = load_mask_per_group[g_idx]
             for start, end, key in db.process_tokens(
@@ -678,25 +698,49 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 chunk_idx = start // db.block_size
                 if chunk_idx >= len(mask) or not mask[chunk_idx]:
                     continue
-                addr, size, _ = db.prepare_value(start, end, req_meta.block_ids[g_idx])
+                addr, size, block_id = db.prepare_value(
+                    start, end, req_meta.block_ids[g_idx]
+                )
                 key_list.append(key.to_string())
                 addr_list.append(addr)
                 size_list.append(size)
+                block_id_list.append(block_id)
 
-        # Rotate lists by tp_rank for load balancing
+        if not key_list:
+            # Scheduler only schedules loads when there are external tokens
+            # beyond the local cache, so block_hashes is non-empty and
+            # mask_num < token_len here. The remaining way to get an empty
+            # key_list is that every chunk was filtered out by the per-group
+            # load mask -- e.g. all candidate blocks lie in the SWA
+            # pre-window that the consumer's spec wouldn't populate locally.
+            logger.warning(
+                "Skipping Mooncake load for request %s: every chunk filtered "
+                "by per-group load mask (token_len=%d, mask_num=%d, "
+                "num_block_hashes=%d)",
+                req_id,
+                token_len,
+                mask_num,
+                len(req_meta.block_hashes),
+            )
+            self.set_finished_request(req_id)
+            self.request_queue.task_done()
+            return
+
+        # Rotate aligned lists by tp_rank for load balancing.
         rotation = self.tp_rank % len(key_list)
-        key_list_c = key_list[rotation:] + key_list[:rotation]
-        addr_list_c = addr_list[rotation:] + addr_list[:rotation]
-        size_list_c = size_list[rotation:] + size_list[:rotation]
+        key_list_c = _rotate_list(key_list, rotation)
+        addr_list_c = _rotate_list(addr_list, rotation)
+        size_list_c = _rotate_list(size_list, rotation)
+        block_id_list_c = _rotate_list(block_id_list, rotation)
 
-        load_batches = [(key_list_c, addr_list_c, size_list_c)]
+        load_batches = [(key_list_c, addr_list_c, size_list_c, block_id_list_c)]
         if self.usable_disk_offload_buffer_budget_bytes is not None:
             total_staging_bytes = sum(
                 _estimate_disk_offload_staging_bytes(size) for size in size_list_c
             )
             if total_staging_bytes > self.usable_disk_offload_buffer_budget_bytes:
                 assert self.disk_offload_buffer_budget_bytes is not None
-                load_batches, oversized_key = _split_disk_offload_load_batches(
+                split_batches, oversized_key = _split_disk_offload_load_batches(
                     key_list_c,
                     addr_list_c,
                     size_list_c,
@@ -705,6 +749,9 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 )
                 if oversized_key is not None:
                     oversized_key_index = key_list_c.index(oversized_key)
+                    self._add_load_error_block_ids(
+                        [block_id_list_c[oversized_key_index]]
+                    )
                     oversized_key_bytes = _estimate_disk_offload_staging_bytes(
                         size_list_c[oversized_key_index]
                     )
@@ -719,11 +766,24 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     self.set_finished_request(req_id)
                     self.request_queue.task_done()
                     return
+                load_batches = []
+                block_id_offset = 0
+                for batch_keys, batch_addrs, batch_sizes in split_batches:
+                    next_block_id_offset = block_id_offset + len(batch_keys)
+                    batch_block_ids = block_id_list_c[
+                        block_id_offset:next_block_id_offset
+                    ]
+                    load_batches.append(
+                        (batch_keys, batch_addrs, batch_sizes, batch_block_ids)
+                    )
+                    block_id_offset = next_block_id_offset
 
         current_batch_keys: list[str] = key_list_c
+        current_batch_block_ids: list[int] = block_id_list_c
         try:
-            for batch_keys, batch_addrs, batch_sizes in load_batches:
+            for batch_keys, batch_addrs, batch_sizes, batch_block_ids in load_batches:
                 current_batch_keys = batch_keys
+                current_batch_block_ids = batch_block_ids
                 tiers_by_key: dict[str, str] | None = None
                 if envs.VLLM_MOONCAKE_STORE_TIER_LOG:
                     tiers_by_key = _get_replica_tiers_by_key(self.store, batch_keys)
@@ -735,20 +795,26 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                         req_id, batch_keys, res, tiers_by_key
                     )
                 failed = [
-                    (key, value)
-                    for key, value in zip(batch_keys, res, strict=True)
+                    (key, value, block_id)
+                    for key, value, block_id in zip(
+                        batch_keys, res, batch_block_ids, strict=True
+                    )
                     if value < 0
                 ]
                 if failed:
+                    self._add_load_error_block_ids(
+                        [block_id for _, _, block_id in failed]
+                    )
                     logger.warning(
                         "Failed to get %d Mooncake keys from sub-batch "
                         "(batch_keys=%d, first_failures=%s)",
                         len(failed),
                         len(batch_keys),
-                        failed[:3],
+                        [(key, value) for key, value, _ in failed[:3]],
                     )
                     break
         except Exception as e:
+            self._add_load_error_block_ids(current_batch_block_ids)
             logger.warning(
                 "Failed to get Mooncake sub-batch %s, error: %s",
                 current_batch_keys[:3],
@@ -1154,6 +1220,11 @@ class MooncakeStoreWorker:
             self.tp_rank,
         )
         return done_sending, done_recving
+
+    def get_block_ids_with_load_errors(self) -> set[int]:
+        if self.kv_recv_thread is None:
+            return set()
+        return self.kv_recv_thread.get_and_clear_block_ids_with_load_errors()
 
     def _get_and_clear_finished_sending(
         self,
