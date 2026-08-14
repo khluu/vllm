@@ -2,8 +2,9 @@ group: Quantization
 depends_on: 
   - image-build
 steps:
-- label: Quantization
-  timeout_in_minutes: 90
+- label: Quantization %N
+  timeout_in_minutes: 40
+  parallelism: 4
   source_file_dependencies:
   - csrc/
   - vllm/model_executor/layers/quantization
@@ -18,7 +19,7 @@ steps:
   # TODO(jerryzh168): resolve the above comment
   - uv pip install --system torchao==0.13.0 --index-url https://download.pytorch.org/whl/cu129
   - uv pip install --system conch-triton-kernels
-  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py
+  - VLLM_TEST_FORCE_LOAD_FORMAT=auto pytest -v -s quantization/ --ignore quantization/test_blackwell_moe.py --shard-id=$$BUILDKITE_PARALLEL_JOB --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT
 
 - label: Quantized MoE Test (B200)
   timeout_in_minutes: 60
