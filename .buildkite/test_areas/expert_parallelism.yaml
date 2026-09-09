@@ -38,6 +38,7 @@ steps:
   - vllm/distributed/eplb
   - tests/distributed/test_eplb_execute.py
   commands:
+  - pytest -v -s v1/attention/test_mla_context_chunks.py
   - pytest -v -s distributed/test_eplb_execute.py
   - pytest -v -s distributed/test_eplb_spec_decode.py
 
