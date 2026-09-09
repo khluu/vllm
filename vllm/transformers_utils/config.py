@@ -5,7 +5,7 @@ import os
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict
-from functools import cache, partial, wraps
+from functools import cache, wraps
 from importlib.metadata import version
 from pathlib import Path
 from typing import Any, Literal, TypeAlias
@@ -13,6 +13,7 @@ from typing import Any, Literal, TypeAlias
 import huggingface_hub
 import torch
 from huggingface_hub import constants
+from huggingface_hub.utils import SafetensorsRepoMetadata
 from packaging.version import Version
 from safetensors.torch import _TYPES as _SAFETENSORS_TO_TORCH_DTYPE
 from transformers import GenerationConfig, PretrainedConfig
@@ -1141,13 +1142,40 @@ def try_get_safetensors_metadata(
     *,
     revision: str | None = None,
 ):
-    get_safetensors_metadata_partial = partial(
-        hf_api().get_safetensors_metadata, model, revision=revision
-    )
+    def get_metadata():
+        api = hf_api()
+        try:
+            return api.get_safetensors_metadata(model, revision=revision)
+        except huggingface_hub.errors.NotASafetensorsRepoError:
+            # The Hub helper only recognizes model.safetensors and its index.
+            # Older GPTQ checkpoints can use custom filenames instead.
+            filenames = [
+                name
+                for name in api.list_repo_files(model, revision=revision)
+                if name.endswith(".safetensors") and "/" not in name
+            ]
+            if not filenames:
+                raise
+            files_metadata = {
+                name: api.parse_safetensors_file_metadata(
+                    model, filename=name, revision=revision
+                )
+                for name in filenames
+            }
+            return SafetensorsRepoMetadata(
+                metadata=None,
+                sharded=len(filenames) > 1,
+                weight_map={
+                    tensor: name
+                    for name, file_metadata in files_metadata.items()
+                    for tensor in file_metadata.tensors
+                },
+                files_metadata=files_metadata,
+            )
 
     try:
         return with_retry(
-            get_safetensors_metadata_partial,
+            get_metadata,
             "Error retrieving safetensors",
             fatal_errors=(huggingface_hub.errors.NotASafetensorsRepoError,),
         )

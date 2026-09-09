@@ -169,6 +169,7 @@ def test_safetensors_metadata_of_repo_without_safetensors():
     )
     api = SimpleNamespace(
         get_safetensors_metadata=get_safetensors_metadata,
+        list_repo_files=MagicMock(return_value=["pytorch_model.bin"]),
         snapshot_download=MagicMock(side_effect=LocalEntryNotFoundError("no cache")),
     )
 
@@ -176,3 +177,35 @@ def test_safetensors_metadata_of_repo_without_safetensors():
         assert get_safetensors_params_metadata("some/pytorch-only-model") == {}
 
     get_safetensors_metadata.assert_called_once()
+
+
+def test_safetensors_metadata_of_custom_named_checkpoint():
+    """Discover GPTQ weights before a custom-named checkpoint is cached."""
+    from huggingface_hub.errors import NotASafetensorsRepoError
+    from huggingface_hub.utils import SafetensorsFileMetadata, TensorInfo
+
+    filename = "gptq_model-4bit-128g.safetensors"
+    tensor_name = "model.layers.0.mlp.down_proj.qweight"
+    tensor = TensorInfo(dtype="I32", shape=[2, 4], data_offsets=(0, 32))
+    api = SimpleNamespace(
+        get_safetensors_metadata=MagicMock(side_effect=NotASafetensorsRepoError),
+        list_repo_files=MagicMock(
+            return_value=[filename, "config.json", "other/model.safetensors"]
+        ),
+        parse_safetensors_file_metadata=MagicMock(
+            return_value=SafetensorsFileMetadata(
+                metadata={}, tensors={tensor_name: tensor}
+            )
+        ),
+        snapshot_download=MagicMock(side_effect=AssertionError("must not download")),
+    )
+
+    with patch.object(config_module, "hf_api", lambda: api):
+        metadata = get_safetensors_params_metadata("org/model", revision="model-pin")
+
+    assert metadata[tensor_name]["dtype"] == "I32"
+    assert metadata[tensor_name]["shape"] == [2, 4]
+    api.list_repo_files.assert_called_once_with("org/model", revision="model-pin")
+    api.parse_safetensors_file_metadata.assert_called_once_with(
+        "org/model", filename=filename, revision="model-pin"
+    )
